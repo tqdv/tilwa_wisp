@@ -141,7 +141,7 @@ def lexemes(text):
           try:
             while True:
                 c, pos = next(chars)
-                if c == "\":
+                if c == "\\":
                     lexeme += c
                     c, pos = next(chars)
                     lexeme += c
@@ -188,6 +188,7 @@ PARENS_DOT = 1
 PARENS_INDENT = 2
 PARENS_PARENS = 3
 PARENS_COLON = 4
+PARENS_QUOTE = 5
 
 # Tag places where we might add parens based on the indentation rule
 def sax_parse(text):
@@ -207,7 +208,7 @@ def sax_parse(text):
         count = 0
         n = len(list)
         for i in range(n):
-            if predicate(list[n-1 - i])
+            if predicate(list[n-1 - i]):
                 count += 1
             else:
                 break
@@ -260,21 +261,31 @@ def sax_parse(text):
             yield SAX_OPEN, None
         
         if new_block:
+          try:
             # At the start of a new block, decide if we open a parens or not
             # Do not open a parens if the block starts with a dot or a parens (only applies if we're at the start of a line)
             indent_type = PARENS_INDENT
             if lex.type in (LEX_OPEN_PARENS, LEX_CLOSE_BRACKET, LEX_OPEN_BRACE):
                 indent_type = PARENS_PARENS
-            elif lex.type == LEX_NON_WHITESPACE and lex.content == ".":
-                indent_type = PARENS_DOT
-                # Omit the dot and the following whitespace
-                lex = next(lexed)
-                if lex.type == LEX_WHITESPACE:
+            elif lex.type == LEX_NON_WHITESPACE:
+                if lex.content == ".":
+                    indent_type = PARENS_DOT
+                    # Omit the dot and the following whitespace
                     lex = next(lexed)
+                    if lex.type == LEX_WHITESPACE:
+                        lex = next(lexed)
+                elif lex.content in ("'", ",", "`", ",@", "#'", "#,", "#`", "#,@"):
+                    yield SAX_NODE, lex
+                    indent_type = PARENS_QUOTE
+                    yield SAX_OPEN, None
+                    lex = next(lexed) # Omit following whitespace
+                    if lex.type == LEX_WHITESPACE:
+                        lex = next(lexed)
 
             if indent_type == PARENS_INDENT:
                 yield SAX_OPEN, None
         
+          finally:
             # Keep track of the indentation
             indents.append(Indentation(indent_type, lex.position.column))
 
@@ -336,9 +347,9 @@ def sax_parse(text):
                         for x in flush_buffer(): yield x
                         for i in range(len(lex.content)):
                             indents.append(Indentation(PARENS_COLON, lex.position.column + i))
+                        lex = next(lexed)
+                        if lex.type == LEX_WHITESPACE:                      # Discard any trailing whitespace after the colon
                             lex = next(lexed)
-                            if lex.type == LEX_WHITESPACE:                  # Discard any trailing whitespace after the colon
-                                lex = next(lexed)
                         break                                               # And pretend we reached the end of a line
                     else:
                         for x in flush_buffer(): yield x
