@@ -59,6 +59,12 @@ The translate function is horrifying and I don't know how to make it simpler.
 
 This implementation is *inspired* by wisp, it doesn't necessarily follow the specification closely.
 
+## License
+
+Use it for Good, not Evil :). See [LICENSE.md][].
+
+Based on the Fuck Around and Find Out License, but with notices and clarifications on personal use and work use.
+
 ## See also
 
 - The repository containing reference implementations by Draketo, the author of wisp: https://hg.sr.ht/~arnebab/wisp/
