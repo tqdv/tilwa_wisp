@@ -187,8 +187,11 @@ class Indentation:
 PARENS_DOT = 1
 PARENS_INDENT = 2
 PARENS_PARENS = 3
-PARENS_COLON = 4
 PARENS_QUOTE = 5
+PARENS_MAYBE = 6
+
+COLON_IN_LINE = 1
+COLON_AT_END_OF_LINE = 2
 
 # Tag places where we might add parens based on the indentation rule
 def sax_parse(text):
@@ -203,91 +206,6 @@ def sax_parse(text):
         for e in buffer:
             yield SAX_NODE, e
         buffer.clear()
-
-    def count_from_end(list, predicate):
-        count = 0
-        n = len(list)
-        for i in range(n):
-            if predicate(list[n-1 - i]):
-                count += 1
-            else:
-                break
-        return count
-    
-    def compute_closing(current_indent):
-        nonlocal indents
-
-        # Close all parens with an indentation levels greater or equal to the current indent, starting from the deepest indent level
-
-        # Handle trailing colons
-        colon_count = count_from_end(indents, lambda x: current_indent <= x.column and x.type == PARENS_COLON)
-        for _ in range(colon_count): indents.pop()
-        for _ in range(colon_count): yield SAX_OPEN, None
-        for _ in range(colon_count): yield SAX_CLOSE, None
-
-        parens_count = len(indents)
-        for i in range(parens_count):
-            last_parens = indents[parens_count-1 - i]
-            if not (current_indent <= last_parens.column):
-                break
-            indents.pop()
-
-            # Parens for colons are already handled
-            if last_parens.type == PARENS_COLON:
-                pass
-            # PARENS_DOT and PARENS_PARENS don't have an opening parens, so no closing one either
-            elif last_parens.type == PARENS_DOT or last_parens.type == PARENS_PARENS:
-                pass
-            else:
-                # We close the block with a parens
-                yield SAX_CLOSE, None
-    
-    def compute_opening(new_block):
-        nonlocal indents, lex
-
-        # Handle the case where we come back here in the middle of a line after a PARENS_COLON
-        # We open as many parens as there are trailing PARENS_COLON in indents
-        colons = []
-        colon_count = count_from_end(indents, lambda x: x.type == PARENS_COLON)
-        for _ in range(colon_count):
-            colons.append(indents.pop())
-        if colon_count > 0 and new_block:
-            # When the colons are followed by something more indented, let the indent open the last parens
-            colon_count -= 1
-        for _ in range(colon_count):
-            colon_indent = colons.pop()
-            indents.append(colon_indent)
-            indents.append(Indentation(PARENS_INDENT, colon_indent.column))
-            yield SAX_OPEN, None
-        
-        if new_block:
-          try:
-            # At the start of a new block, decide if we open a parens or not
-            # Do not open a parens if the block starts with a dot or a parens (only applies if we're at the start of a line)
-            indent_type = PARENS_INDENT
-            if lex.type in (LEX_OPEN_PARENS, LEX_CLOSE_BRACKET, LEX_OPEN_BRACE):
-                indent_type = PARENS_PARENS
-            elif lex.type == LEX_NON_WHITESPACE:
-                if lex.content == ".":
-                    indent_type = PARENS_DOT
-                    # Omit the dot and the following whitespace
-                    lex = next(lexed)
-                    if lex.type == LEX_WHITESPACE:
-                        lex = next(lexed)
-                elif lex.content in ("'", ",", "`", ",@", "#'", "#,", "#`", "#,@"):
-                    yield SAX_NODE, lex
-                    indent_type = PARENS_QUOTE
-                    yield SAX_OPEN, None
-                    lex = next(lexed) # Omit following whitespace
-                    if lex.type == LEX_WHITESPACE:
-                        lex = next(lexed)
-
-            if indent_type == PARENS_INDENT:
-                yield SAX_OPEN, None
-        
-          finally:
-            # Keep track of the indentation
-            indents.append(Indentation(indent_type, lex.position.column))
 
     def handle_parenthesized_form():
         nonlocal lex
@@ -317,64 +235,147 @@ def sax_parse(text):
                     raise UnmatchedParens()
             
             yield SAX_NODE, lex
+    
+    # Also buffer the current value of lex
+    def buffer_whitespace_and_newlines():
+        nonlocal lex
+        while True:
+            if lex.type in (LEX_WHITESPACE, LEX_COMMENT, LEX_NEWLINE):
+                buffer.append(lex)
+            else:
+                break
+            lex = next(lexed)
 
-    # Loop on lexemes to handle empty lines (including comments)
-    try:
+    def lex_is_colon(lex):
+        return lex.type == LEX_NON_WHITESPACE and all([x == ':' for x in lex.content])
+
+    def determine_colon_location():
+        nonlocal lex
         while True:
             lex = next(lexed)
-            if lex.type == LEX_WHITESPACE or lex.type == LEX_COMMENT:    # Buffer whitespace and comments in case the line is not empty
+            if lex.type == LEX_WHITESPACE or lex.type == LEX_COMMENT:
                 buffer.append(lex)
-            elif lex.type == LEX_NEWLINE:                                # If we find newline, the line was indeed empty. Emit the line's lexemes
-                for x in flush_buffer(): yield x
-                yield SAX_NODE, lex
-            else:                                                        # Otherwise the line isn't empty, and we stop looping
-                break
-        
-        # Each iteration handles a new indented line
-        new_block = True
-        while True:
-            for x in compute_closing(lex.position.column): yield x  # Close blocks as needed
-            for x in flush_buffer(): yield x                        # Emit optional whitespace
-            for x in compute_opening(new_block): yield x            # Open blocks as needed
+            elif lex.type == LEX_NEWLINE:
+                return COLON_AT_END_OF_LINE
+            else:
+                return COLON_IN_LINE
+    
+    def handle_colon_in_line(colon):
+        for i in range(len(colon.content)):
+            indents.append(Indentation(PARENS_INDENT, colon.position.column+i))
+            yield SAX_OPEN, None
+        buffer.clear() # Discard following whitespace FIXME
 
-            # Handle the line
+    def handle_colon_at_end_of_line(colon, current_indent):
+        colon_count = len(colon.content) - 1 # Omit the last one because it's special
+        emit_before_ws = max(0, min(colon_count, current_indent - colon.position.column)) # clamp to [0; colon_count]
+
+        col = colon.position.column
+        for _ in range(emit_before_ws):
+            indents.append(Indentation(PARENS_INDENT, col))
+            col += 1
+            yield SAX_OPEN, None
+
+        emit_after_ws = colon_count - emit_before_ws
+        if emit_after_ws > 0:
+            for x in flush_buffer(): yield x
+            for _ in range(emit_after_ws):
+                indents.append(Indentation(PARENS_INDENT, col))
+                col += 1
+                yield SAX_OPEN, None
+        
+        # The last parens may get negated by a dot or a parenthesized form
+        indents.append(Indentation(PARENS_MAYBE, col))
+    
+    def compute_closing(current_indent):
+        # Close all parens with an indentation levels greater or equal to the current indent, starting from the deepest indent level
+        for i in reversed(range(len(indents))):
+            last_parens = indents[i]
+            if not (current_indent <= last_parens.column):
+                break
+            indents.pop()
+
+            # Handle a potential parens from a colon
+            if last_parens.type == PARENS_MAYBE:
+                yield SAX_OPEN, None
+                yield SAX_CLOSE, None
+            # PARENS_DOT and PARENS_PARENS don't have an opening parens, so no closing one either
+            elif last_parens.type == PARENS_DOT or last_parens.type == PARENS_PARENS:
+                pass
+            else:
+                # We close the block with a parens
+                yield SAX_CLOSE, None
+    
+    def compute_opening():
+        nonlocal lex
+        indent_type = PARENS_INDENT
+        if len(indents) > 0 and indents[-1].type == PARENS_MAYBE:
+            indents.pop()
+
+        # At the start of a new block, decide if we open a parens or not
+        # Do not open a parens if the block starts with a dot or a parens
+        try:
+            if lex.type in (LEX_OPEN_PARENS, LEX_CLOSE_BRACKET, LEX_OPEN_BRACE):
+                indent_type = PARENS_PARENS
+            elif lex.type == LEX_NON_WHITESPACE:
+                if lex.content == ".":
+                    indent_type = PARENS_DOT
+                    # Omit the dot and the following whitespace
+                    lex = next(lexed)
+                    if lex.type == LEX_WHITESPACE:
+                        lex = next(lexed)
+                elif lex.content in ("'", ",", "`", ",@", "#'", "#,", "#`", "#,@"):
+                    yield SAX_NODE, lex
+                    indent_type = PARENS_QUOTE
+                    yield SAX_OPEN, None
+                    lex = next(lexed) # Omit following whitespace
+                    if lex.type == LEX_WHITESPACE:
+                        lex = next(lexed)
+
+            if indent_type == PARENS_INDENT:
+                yield SAX_OPEN, None
+        finally:
+            # Keep track of the indentation
+            indents.append(Indentation(indent_type, lex.position.column))
+        
+
+    try:
+        # Each iteration handles a new indented line
+        lex = next(lexed)
+        while True:
+            buffer_whitespace_and_newlines()
+            for x in compute_closing(lex.position.column): yield x # Close blocks as needed
+            for x in flush_buffer(): yield x                       # Emit optional whitespace
+            for x in compute_opening(): yield x                    # Open blocks as needed
+
+            # Processing the line
             while True:
-                new_block = False
                 if lex.type == LEX_WHITESPACE or lex.type == LEX_COMMENT:  # Buffer whitespace and comments
                     buffer.append(lex)
-                elif lex.type == LEX_NON_WHITESPACE:                       # Passthrough non-whitespace, unless it's a colon,
-                    if all(map(lambda x: x == ':', lex.content)):          # in which case we start a new block
-                        for x in flush_buffer(): yield x
-                        for i in range(len(lex.content)):
-                            indents.append(Indentation(PARENS_COLON, lex.position.column + i))
-                        lex = next(lexed)
-                        if lex.type == LEX_WHITESPACE:                      # Discard any trailing whitespace after the colon
-                            lex = next(lexed)
-                        break                                               # And pretend we reached the end of a line
-                    else:
-                        for x in flush_buffer(): yield x
-                        yield SAX_NODE, lex
-                elif lex.type in (LEX_OPEN_PARENS, LEX_CLOSE_BRACKET, LEX_OPEN_BRACE):  # Skip over parenthesized things
-                    for x in flush_buffer(): yield x
+                elif lex.type in (LEX_OPEN_PARENS, LEX_CLOSE_BRACKET, LEX_OPEN_BRACE):
+                    for x in flush_buffer(): yield x                       # ^ Skip over parenthesized forms
                     for x in handle_parenthesized_form(): yield x
-                elif lex.type == LEX_NEWLINE:                               # Found a newline, break out of the loop to handle it
-                    new_block = True
-                    buffer.append(lex)
-                    lex = next(lexed)
+                elif lex_is_colon(lex):                                    # Handle colons
+                    colon_lex = lex
+                    for x in flush_buffer(): yield x
+                    try:
+                        colon_location = determine_colon_location()            #   NB After this call, lex is the next lexeme to process
+                        if colon_location == COLON_IN_LINE:                    #   if the colon is inline, emit the corresponding parens
+                            for x in handle_colon_in_line(colon_lex): yield x  #     We skip reading a new lexeme before processing them as we already did that
+                            continue                                           #     while processing
+                        else: # COLON_AT_END_OF_LINE                           #   otherwise, check the next block's indentation to know what to do
+                            buffer_whitespace_and_newlines()
+                            for x in handle_colon_at_end_of_line(colon_lex, lex.position.column): yield x
+                            break                                          #     Handle the new block's indentation (if any)
+                    except:
+                        for x in handle_colon_at_end_of_line(colon_lex, lex.position.column): yield x
+                        raise
+                elif lex.type == LEX_NEWLINE:                              # Newlines means new block
                     break
-                else:                                                       # Passthrough other lexemes
+                else:                                                      # By default, passthrough the lexeme
+                    for x in flush_buffer(): yield x
                     yield SAX_NODE, lex
-                lex = next(lexed)                                           # And onto the next lexeme
-
-            # Store any subsequent empty lines for later
-            while True:
-                if lex.type == LEX_WHITESPACE or lex.type == LEX_COMMENT:
-                    buffer.append(lex)
-                elif lex.type == LEX_NEWLINE:
-                    new_block = True
-                    buffer.append(lex)
-                else:
-                    break
+                # Read the next lexeme at the end of the loop iteration
                 lex = next(lexed)
     except StopIteration:
         for x in compute_closing(0): yield x
